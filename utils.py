@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # encoding: utf-8
 
-from genericpath import exists
 import subprocess
 import os
 import sys
@@ -9,19 +8,23 @@ import paramiko
 import logging
 import argparse
 import socket
+import shlex
+import MySQLdb
 
 LOG_FILE = '/var/log/cas_net_protect.log'
 LOG = logging.getLogger(__name__)
 
-LOG_LEVEL = {'debug': logging.DEBUG,
-          'info': logging.INFO,
-          'warning': logging.WARNING,
-          'error': logging.ERROR,
-          'critical': logging.CRITICAL}
+LOG_LEVEL = {
+                'debug': logging.DEBUG,
+                'info': logging.INFO,
+                'warning': logging.WARNING,
+                'error': logging.ERROR,
+                'critical': logging.CRITICAL
+            }
 
 def log_init(loglevel=LOG_LEVEL['debug']):
 	logging.basicConfig(level=loglevel, filename=LOG_FILE,
-				        format="%(asctime)s %(name)s[%(lineno)d] %(levelname)s"
+				        format="%(asctime)s %(filename)s %(funcName)s [%(lineno)d] %(levelname)s"
 				        " %(message)s", datefmt='%Y-%m-%d %H:%M:%S %a')
 
 class SSHConnection(object):
@@ -39,7 +42,7 @@ class SSHConnection(object):
         except Exception as exc:
             LOG.error("ssh connection failed: %s" % str(exc))
             sys.exit(1)
-    
+
     def close(self, s):
         s.close()
 
@@ -71,13 +74,74 @@ class SFTPConnection(object):
     def close(self, s):
         s.close()
 
+class MySQLConnection(object):
+    def __init__(self, host='localhost', username='root', password='1q2w3e@4R'):
+        self.host = host
+        self.username = username
+        self.password = password
+
+    def connect_db(self, db='vservice', charset='utf8'):
+        try:
+            db = MySQLdb.connect(self.host, self.username, self.password, db = db, charset=charset)
+        except Exception as e:
+            LOG.error("fail to connect mysql server (%s)", str(e))
+
+        return db
+
+    def get_currsor(self, db):
+        return db.cursor()
+
+    def close_cursor(self, cursor):
+        cursor.close()
+
+    def close_db(self, db):
+        db.close()
+
+def is_valid_ip(ip):
+    try:
+        socket.inet_pton(socket.AF_INET, ip)
+    except:
+        return False
+    return True
+
+def is_valid_ip6(ip):
+    try:
+        socket.inet_pton(socket.AF_INET6, ip)
+    except:
+        return False
+    return True
+
+def host_execute_cmd(cmd, shell=True, timeout=False):
+    if not shell and isinstance(cmd, str):
+        cmd = shlex.split(cmd)
+
+    LOG.debug("Running cmd: %s on host", cmd)
+
+    p = subprocess.Popen(cmd, shell=shell, stderr=subprocess.PIPE, stdout=subprocess.PIPE, close_fds=True)
+
+    if timeout:
+        try:
+            out, err = p.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            LOG.error("cmd: %s run timeout(%ss) on host, exit!" % (cmd, timeout))
+            sys.exit(1)
+    else:
+        out, err = p.communicate()
+
+    if p.returncode != 0:
+        LOG.error("cmd: %s run failed, out: %s, err: %s, return_code: %s", cmd, out, err, p.returncode)
+
+    LOG.debug("Running cmd: %s on host success.", cmd)
+    return out, err
+
 def ssh_execute_cmd(cmd, ip):
     """ Run cmd via ssh
         :param ip:  remote ip
         :param cmd: command to run
         :return:    (stdout, stderr) of cmd execution
     """
-    
+
     LOG.debug("Running cmd: %s on %s via ssh", cmd, ip)
 
     ssh_instance = SSHConnection(ip)
@@ -88,16 +152,18 @@ def ssh_execute_cmd(cmd, ip):
         stderr = estream.read()
         istream.close()
         exit_code = ostream.channel.recv_exit_status()
+        ssh_instance.close(ssh_client)
     except Exception as exc:
         LOG.error("Run cmd: %s failed on ip %s via ssh! (%s)" % (cmd, ip, str(exc)))
         sys.exit(1)
-    
+
     LOG.debug("cmd stdout: %s, stderr: %s, exit_code: %s", stdout, stderr, exit_code)
-    ssh_instance.close(ssh_client)
 
     if exit_code != -1 and exit_code != 0:
         LOG.error("Run cmd: %s failed on %s via ssh(exit_code:%s)", cmd, ip, exit_code)
         raise RuntimeError(stderr.strip() + stdout.strip())
+
+    LOG.debug("Running cmd: %s on %s via ssh success.", cmd, ip)
 
     return (stdout, stderr)
 
@@ -168,82 +234,126 @@ def sftp_download_file(r_filepath, l_dir, ip, username='root', password=None):
         LOG.error("download file %s to %s from %s failed!(%s)" % (r_filepath, l_dir, ip, str(exc)))
         sys.exit(1)
 
-def is_valid_ip(ip):
-    try:
-        socket.inet_pton(socket.AF_INET, ip)
-    except:
-        return False
-    return True
+def scp_upload_files(localpath, remotepath, ip, username='root'):
+    """ scp upload dir to remote """
 
-def is_valid_ip6(ip):
-    try:
-        socket.inet_pton(socket.AF_INET6, ip)
-    except:
-        return False
-    return True
-
-def usage():
-    print "python untils.py [-t] ssh [-i] ip [-c] cmd [-l] loglevel"
-    print "python untils.py [-t] sftp [-c] put|get [-i] ip [-f] file [-d] dir [-l] loglevel"
-
-
-def parse_input_args():
-    desc = (
-        'test untils.py'
-    )
-
-    parser = argparse.ArgumentParser(description=desc)
-    parser.add_argument('-t', '--test', dest='test', help="specify test name")
-    parser.add_argument('-i', '--ipaddr', dest='ipaddr', help="specify remote ip addr")
-    parser.add_argument('-c', '--cmd', dest='cmd', help="specify remote run command")
-    parser.add_argument('-f', '--file', dest='file', help="specify file path to upload via sftp")
-    parser.add_argument('-d', '--dir', dest='dir', help="specify remote dir")
-    parser.add_argument('-l', '--loglevel', dest='loglevel', nargs='?', default='debug', help="specify log level")
-
-    LOG.debug("input args: %s", sys.argv[1:])
-    if len(sys.argv) <=1 or (len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help']):
-        usage()
-        sys.exit(0)
-
-    args = parser.parse_args()
-    if args.ipaddr and not is_valid_ip(args.ipaddr) and not is_valid_ip6(args.ipaddr):
-        print "Invalid remote ip"
+    if not is_valid_ip(ip) and not is_valid_ip6(ip):
+        LOG.error("ip %s not valid for scp.", ip)
         sys.exit(1)
 
-    return args.__dict__
+    if is_valid_ip6(ip):
+        ip = '[' + ip + ']'
 
-def ssh_test(cmd, ip):
+    cmd = 'timeout 15 scp -r %s %s@%s:%s' %(localpath, username, ip, remotepath)
+
+    try:
+        host_execute_cmd(cmd)
+        LOG.info("%s run success.", cmd)
+    except Exception as e:
+        LOG.error("%s run failed.", cmd)
+        sys.exit(1)
+
+def mysqldb_search(sqlname):
+    """ serch sql in MySQLdb """
+    mysql_instance = MySQLConnection()
+    try:
+        db = mysql_instance.connect_db()
+        cursor = mysql_instance.get_currsor(db)
+        cursor.execute(sqlname)
+        ret = cursor.fetchall()
+        mysql_instance.close_cursor(cursor)
+        mysql_instance.close_db(db)
+    except Exception as e:
+        LOG.error("%s failed. (%s)", sqlname, str(e))
+        sys.exit(1)
+
+    LOG.debug("%s success.", sqlname)
+    return ret
+
+def parse_args(argv):
+    top_parser = argparse.ArgumentParser(description='utils')
+    top_parser.add_argument('-l', '--loglevel', dest='loglevel', nargs='?', default='debug', help="specify utils log level")
+
+    subparsers = top_parser.add_subparsers(help='operation type')
+
+    host_parser = subparsers.add_parser('host', help='host operation')
+    host_parser.add_argument('-c', '--cmd', required=True, dest='cmd', help="specify host run command")
+    host_parser.set_defaults(func=host_operation_test)
+
+    ssh_parser = subparsers.add_parser('ssh', help='ssh operation')
+    ssh_parser.add_argument('-i', '--ipaddr', required=True, dest='ipaddr', help="specify remote ip addr")
+    ssh_parser.add_argument('-c', '--cmd', required=True, dest='cmd', help="specify remote run command")
+    ssh_parser.set_defaults(func=ssh_operation_test)
+
+    sftp_parser = subparsers.add_parser('sftp', help='sftp operation')
+    sftp_parser.add_argument('-i', '--ipaddr', required=True, dest='ipaddr', help="specify remote ip addr")
+    sftp_parser.add_argument('-c', '--cmd', required=True, dest='cmd', help="specify sftp upload or download")
+    sftp_parser.add_argument('-l', '--localpath', required=True, dest='localpath', help="specify local file path to upload or download via sftp")
+    sftp_parser.add_argument('-r', '--remotepath', required=True, dest='remotepath', help="specify remote path")
+    sftp_parser.set_defaults(func=sftp_operation_test)
+
+    scp_parser = subparsers.add_parser('scp', help='scp operation')
+    scp_parser.add_argument('-i', '--ipaddr', required=True, dest='ipaddr', help="specify remote ip addr")
+    scp_parser.add_argument('-l', '--localpath', required=True, dest='localpath', help="specify local path to upload or download via scp")
+    scp_parser.add_argument('-r', '--remotepath', required=True, dest='remotepath', help="specify remote path")
+    scp_parser.set_defaults(func=scp_operation_test)
+
+    mysql_parser = subparsers.add_parser('mysql', help='mysql operation')
+    mysql_parser.add_argument('-s', '--sql', required=True, dest='sql', help="specify sqlname to search")
+    mysql_parser.set_defaults(func=mysql_operation_test)
+
+    args = top_parser.parse_args(argv)
+    return args
+
+def ssh_operation_test(argv):
+    cmd = argv.cmd
+    ip = argv.ipaddr
+
     out, err = ssh_execute_cmd(cmd, ip)
     print "[%s] retutn: %s" % (cmd, out)
 
-def sftp_test(cmd, filepath, dir, ip):
+
+def sftp_operation_test(argv):
+    cmd = argv.cmd
+    ip = argv.ipaddr
+    localpath = argv.localpath
+    remotepath = argv.remotepath
+
     if cmd == 'put':
-        sftp_upload_file(filepath, dir, ip)
+        sftp_upload_file(localpath, remotepath, ip)
     elif cmd == 'get':
-        sftp_download_file(filepath, dir, ip)
+        sftp_download_file(remotepath, localpath, ip)
 
-def test_run():
+def scp_operation_test(argv):
+    ip = argv.ipaddr
+    localpath = argv.localpath
+    remotepath = argv.remotepath
+
+    scp_upload_files(localpath, remotepath, ip)
+
+def host_operation_test(argv):
+    cmd = argv.cmd
+
+    out, err = host_execute_cmd(cmd)
+    print "[%s] return: %s " % (cmd, out)
+
+def mysql_operation_test(argv):
+    sqlname = argv.sql
+
+    ret = mysqldb_search(sqlname)
+    print ret
+
+def main():
     log_init()
-    args_dict = parse_input_args()
-    if args_dict['loglevel']:
-        LOG.setLevel(LOG_LEVEL[args_dict['loglevel']])
 
-    if not args_dict['test']:
-        raise RuntimeError("miss test name!")
-
-    if args_dict['test'] == "ssh":
-        ssh_test(args_dict['cmd'], args_dict['ipaddr'])
-    elif args_dict['test'] == "sftp":
-        cmd = args_dict['cmd']
-        filepath = args_dict['file']
-        dir = args_dict['dir']
-        sftp_test(cmd, filepath, dir, args_dict['ipaddr'])
-    else:
-        print "Not support test: %s" % args_dict['test']
-
+    try:
+        argv = parse_args(sys.argv[1:])
+        if argv.loglevel:
+            LOG.setLevel(LOG_LEVEL[argv.loglevel])
+        argv.func(argv)
+    except Exception as e:
+        LOG.error(str(e))
+        sys.exit(1)
 
 if __name__ == '__main__':
-    try:
-        test_run()
-    except Exception as exc:
-        LOG.error("untils test run failed: %s", str(exc))
+    sys.exit(main())
