@@ -9,7 +9,10 @@ import logging
 import argparse
 import socket
 import shlex
-import MySQLdb
+import ConfigParser
+
+if os.path.exists('etc/cvm'):
+    import MySQLdb
 
 LOG_FILE = '/var/log/cas_net_protect.log'
 LOG = logging.getLogger(__name__)
@@ -96,6 +99,50 @@ class MySQLConnection(object):
 
     def close_db(self, db):
         db.close()
+
+class NetProtecter(object):
+    def __init__(self, config='/etc/cvk/cas_net_protect.conf'):
+        self.config = config
+        self.ports = { 'black_ports':[], 'white_ips':[] }
+        self.deny_ips = { 'deny_ips':[] }
+        self.mariadb = { 'enable':False }
+
+    def read_config(self):
+        """
+            #cas_net_protect.conf
+            [ports]
+            black_ports=aa,bb
+            white_ips=x.x.x.x,y.y.y.y
+            [deny_ips]
+            deny_ips=x.x.x.x,y.y.y.y
+            [mariadb]
+            enable=true
+        """
+        if not os.path.exists(self.config):
+            LOG.error("net protecter config not exist.")
+            return False
+
+        config_parser = ConfigParser.ConfigParser()
+        config_parser.read(self.config)
+        try:
+            for port in config_parser.get('ports', 'black_ports').split(','):
+                self.ports['black_ports'].append(port)
+            for ip in config_parser.get('ports', 'white_ips').split(','):
+                self.ports['white_ips'].append(ip)
+
+            for ip in config_parser.get('deny_ips', 'deny_ips').split(','):
+                self.deny_ips['deny_ips'].append(ip)
+
+            if config_parser.get('mariadb', 'enable') == 'true':
+                self.mariadb['enable'] = True
+        except Exception as e:
+            LOG.error("read config: %s failed.(%s)!", self.config, str(e))
+            return False
+        return True
+
+    def get_config(self):
+        return { 'ports':self.ports, 'deny_ips':self.deny_ips, 'mariadb':self.mariadb }
+
 
 def is_valid_ip(ip):
     try:
@@ -302,6 +349,11 @@ def parse_args(argv):
     mysql_parser.add_argument('-s', '--sql', required=True, dest='sql', help="specify sqlname to search")
     mysql_parser.set_defaults(func=mysql_operation_test)
 
+    all_parser = subparsers.add_parser('all', help='netprotect operation for all config')
+    all_parser.add_argument('-e', '--enable', action='store_true', help="enable all protect")
+    all_parser.add_argument('-d', '--disable', action='store_true', help="disable all protect")
+    all_parser.set_defaults(func=all_operation_test)
+
     args = top_parser.parse_args(argv)
     return args
 
@@ -342,6 +394,23 @@ def mysql_operation_test(argv):
 
     ret = mysqldb_search(sqlname)
     print ret
+
+def all_operation_test(argv):
+    p = NetProtecter()
+    if argv.enable:
+        print "net protect enable all"
+    elif argv.disable:
+        print "net protect disable all"
+    else:
+        print "missing action."
+        return
+
+    if p.read_config():
+        print "net protect read config ok"
+    else:
+        print "net protect read config failed"
+        sys.exit(1)
+    print "config: %s" % (p.get_config())
 
 def main():
     log_init()
